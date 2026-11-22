@@ -29,8 +29,8 @@ overhead — so it's dramatically lighter than a full VM.
 
 1. [Why this exists](#why-this-exists)
 2. [Features](#features)
-3. [Requirements](#requirements)
-4. [Installation](#installation)
+3. [Requirements](#requirements) (incl. [distro support](#distro-support))
+4. [Installation](#installation) (Debian / Fedora / Arch)
 5. [Usage](#usage)
 6. [How it works (technical deep-dive)](#how-it-works-technical-deep-dive)
 7. [Agent / CI automation](#agent--ci-automation)
@@ -102,13 +102,43 @@ Also:
 - `waydroid-container` systemd service enabled.
 - `waydroid init` must have been run at least once (downloads the Android image).
 
+### Distro support
+
+`install.sh` auto-detects your distro and prints the correct install commands.
+The scripts themselves are plain bash + standard tools, so they run anywhere
+Waydroid does.
+
+| Distro family | Examples | Support |
+|---------------|----------|---------|
+| **Debian / Ubuntu** | Ubuntu, Linux Mint, Pop!_OS, elementary, Zorin, KDE neon, Debian | ✅ Full (Waydroid's primary target) |
+| **Arch** | Arch, EndeavourOS, Manjaro, Garuda | ✅ Full (AUR: `waydroid`, `waydroid-image`) |
+| **Fedora / RHEL** | Fedora, Rocky, Alma | ⚠️ Works with COPR repo + SELinux note (see below) |
+| **openSUSE** | openSUSE Leap/Tumbleweed | ⚠️ Community repo |
+| **NixOS / Gentoo / Void** | — | ⚠️ Manual (no official package) |
+| **Alpine** | Alpine | ❌ musl libc — Waydroid is glibc-only |
+
+**Fedora** needs the COPR repo and possibly an SELinux policy:
+```bash
+sudo dnf copr enable waydroid/stable
+sudo dnf install waydroid weston android-tools
+# if SELinux blocks it:
+sudo ausearch -c 'waydroid' --raw | audit2allow -M waydroid
+sudo semodule -i waydroid.pp
+```
+
+**Arch** (AUR):
+```bash
+yay -S waydroid waydroid-image weston android-tools
+```
+
 > **Note:** These scripts assume Waydroid is already installed and initialized.
 > For a full from-scratch setup, follow the [official Waydroid install guide](https://docs.waydro.id/usage/install-on-desktops)
 > first, then run `./install.sh` from this repo.
 
-Check your system with:
+Check your system (detects distro + verifies prerequisites):
 ```bash
 ./install.sh --check
+./install.sh --distro   # just show detected distro
 ```
 
 ---
@@ -117,14 +147,28 @@ Check your system with:
 
 ### 1. Install Waydroid (if you haven't)
 
+**Debian / Ubuntu / Linux Mint:**
 ```bash
-# Debian / Ubuntu / Linux Mint
 sudo apt install waydroid
-
-# Initialize (downloads the Android system + vendor images, ~2.4 GB)
 sudo waydroid init
+sudo systemctl enable --now waydroid-container
+```
 
-# Enable the container service
+**Fedora / RHEL:**
+```bash
+sudo dnf copr enable waydroid/stable
+sudo dnf install waydroid weston android-tools
+sudo waydroid init
+sudo systemctl enable --now waydroid-container
+# if SELinux blocks Waydroid:
+sudo ausearch -c 'waydroid' --raw | audit2allow -M waydroid
+sudo semodule -i waydroid.pp
+```
+
+**Arch / EndeavourOS / Manjaro:**
+```bash
+yay -S waydroid waydroid-image weston android-tools
+sudo waydroid init
 sudo systemctl enable --now waydroid-container
 ```
 
