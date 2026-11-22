@@ -8,5 +8,10 @@ Thumbs.db
 *.log
 *.img
 *.apk
+
+# Screenshots we DO want in docs/ are force-added; ignore stray PNGs elsewhere
 *.png
+!docs/*.png
+
+# Waydroid runtime lock files
 waydroid-*.lock
