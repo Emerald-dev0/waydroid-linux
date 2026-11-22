@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Launch Waydroid on an X11 session.
+#
+# Waydroid is a Wayland application, but this machine logs into Cinnamon/X11
+# where no Wayland compositor runs, so `waydroid session start` normally fails
+# with "Wayland socket ... doesn't exist". This script provides that Wayland
+# compositor by running a nested `weston` on top of X11, boots the Waydroid
+# session inside it, then asks the session to show its UI. The window that
+# appears IS the Android screen; closing it shuts everything back down.
+set -u
+
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+SOCKET="wayland-0"
+export WAYLAND_DISPLAY="$SOCKET"
+WESTON_LOG=/tmp/waydroid-weston.log
+SESSION_LOG=/tmp/waydroid-session.log
+LOCK=/tmp/waydroid-ui.lock
+
+log() { echo "[waydroid-ui] $*"; }
+notify() { command -v notify-send >/dev/null 2>&1 && notify-send "Waydroid" "$*" 2>/dev/null || true; }
+
+cleanup() {
+    trap - EXIT INT TERM
+    log "shutting down"
+    waydroid session stop >/dev/null 2>&1 || true
+    [ -n "${WESTON_PID:-}" ] && kill "$WESTON_PID" 2>/dev/null || true
+    rm -rf "$LOCK" 2>/dev/null || true
+}
+
+# Only one instance at a time (reclaim a stale lock left by a killed process).
+if ! mkdir "$LOCK" 2>/dev/null; then
+    if [ -f "$LOCK/pid" ] && kill -0 "$(cat "$LOCK/pid" 2>/dev/null)" 2>/dev/null; then
+        log "Waydroid is already running"
+        exit 0
+    fi
+    rm -rf "$LOCK" 2>/dev/null
+    mkdir "$LOCK" 2>/dev/null || { log "Waydroid is already launching"; exit 0; }
+fi
+echo "$$" >"$LOCK/pid"
+
+# Arm cleanup only once we own the lock, so a refused second instance never
+# tears down the instance that is already running.
+trap cleanup EXIT INT TERM
+
+# 1) Start a nested Wayland compositor (weston on the X11 backend).
+rm -f "$XDG_RUNTIME_DIR/$SOCKET" "$XDG_RUNTIME_DIR/$SOCKET.lock"
+log "starting nested Wayland compositor"
+weston --backend=x11-backend.so --shell=kiosk --socket="$SOCKET" \
+       --width=1280 --height=720 >"$WESTON_LOG" 2>&1 &
+WESTON_PID=$!
+for _ in $(seq 1 40); do
+    [ -S "$XDG_RUNTIME_DIR/$SOCKET" ] && break
+    sleep 0.25
+done
+if [ ! -S "$XDG_RUNTIME_DIR/$SOCKET" ]; then
+    log "ERROR: compositor failed to start; see $WESTON_LOG"
+    notify "Failed to start the Wayland compositor. See $WESTON_LOG"
+    exit 1
+fi
+
+# 2) Boot the Waydroid session and wait until Android is actually ready.
+#    (`waydroid status` flips to RUNNING as soon as the LXC container starts,
+#    which is much earlier than Android finishing its boot.)
+# If a headless session (from waydroid-emu) is running it is bound to a
+# different Wayland socket, so the UI would not be visible. Restart it here.
+if waydroid status 2>/dev/null | grep -q 'Session:[[:space:]]*RUNNING'; then
+    cur=$(waydroid status 2>/dev/null | awk -F'\t' '/Wayland display/{print $2}')
+    if [ -n "$cur" ] && [ "$cur" != "$SOCKET" ]; then
+        log "restarting a '$cur' session on '$SOCKET' so the UI is visible"
+        waydroid session stop >/dev/null 2>&1 || true
+        pkill -f "weston .*--socket=waydroid-emu" 2>/dev/null || true
+        sleep 3
+    fi
+fi
+log "starting Waydroid session (first boot can take up to ~90s)"
+: >"$SESSION_LOG"
+waydroid session start >"$SESSION_LOG" 2>&1 &
+SESSION_PID=$!
+for _ in $(seq 1 150); do
+    grep -q 'is ready' "$SESSION_LOG" 2>/dev/null && break
+    kill -0 "$WESTON_PID" 2>/dev/null || { log "ERROR: window was closed during boot"; exit 1; }
+    sleep 1
+done
+if ! grep -q 'is ready' "$SESSION_LOG" 2>/dev/null; then
+    log "ERROR: Android did not finish booting; see $SESSION_LOG"
+    notify "Android failed to boot. See $SESSION_LOG"
+    exit 1
+fi
+
+# 3) Ask the running session to show its UI. This returns immediately - the
+#    session itself keeps rendering the Android screen into the compositor.
+log "showing Android UI"
+waydroid show-full-ui
+notify "Android is ready"
+
+# 4) Stay alive while the window is open. Closing it terminates weston, which
+#    releases us and triggers the cleanup above.
+log "Android is running - close the window to quit"
+wait "$WESTON_PID"

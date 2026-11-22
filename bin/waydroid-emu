@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# Headless Waydroid emulator for automation / AI agents / CI.
+#
+# Boots Android without a visible window and exposes it over ADB (network), so
+# tools and agents can install, launch, view (screenshots) and drive apps.
+#
+# Usage:
+#   waydroid-emu start            # boot the emulator headless + connect adb
+#   waydroid-emu ensure           # same as start (instant if already running)
+#   waydroid-emu stop             # shut the emulator down
+#   waydroid-emu status           # show session state + adb devices
+#   waydroid-emu connect          # (re)connect adb to the running device
+#   waydroid-emu ip               # print the device address (ip:5555)
+#   waydroid-emu shot [file]      # screenshot (default /tmp/waydroid-shot.png)
+#   waydroid-emu tap X Y          # tap at coordinates
+#   waydroid-emu swipe X1 Y1 X2 Y2 [ms]
+#   waydroid-emu text "hello"     # type text
+#   waydroid-emu key KEYCODE      # e.g. KEYCODE_HOME KEYCODE_BACK KEYCODE_APP_SWITCH
+#   waydroid-emu install app.apk  # install (upgrade) an APK
+#   waydroid-emu launch PKG       # launch by package, or PKG/Activity
+#   waydroid-emu packages         # list installed packages
+#   waydroid-emu logcat [N]       # dump last N log lines (default 200)
+#   waydroid-emu shell "cmd"      # run a raw adb shell command
+#
+# TIP: leave the emulator running. While it is up, `waydroid-emu start`
+# (or `ensure`) returns in ~0.3s; only the first cold boot is slow.
+# Once running, plain `adb -s <ip:5555> ...` works too.
+set -u
+
+ADB="$(command -v adb || true)"
+[ -x "$ADB" ] || ADB="$HOME/Android/Sdk/platform-tools/adb"
+
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+SOCKET="waydroid-emu"
+WESTON_LOG=/tmp/waydroid-emu-weston.log
+SESSION_LOG=/tmp/waydroid-emu-session.log
+LOCK=/tmp/waydroid-emu.lock
+LEASE=/var/lib/misc/dnsmasq.waydroid0.leases
+PORT=5555
+
+log() { echo "[waydroid-emu] $*"; }
+die() { echo "[waydroid-emu] ERROR: $*" >&2; exit 1; }
+
+dev_ip() {
+    local ip=""
+    [ -r "$LEASE" ] && ip=$(awk 'NR==1{print $3}' "$LEASE" 2>/dev/null)
+    [ -z "$ip" ] && ip=$(waydroid status 2>/dev/null | awk -F'\t' '/IP address/{print $2}')
+    [ -n "$ip" ] && echo "$ip"
+}
+
+addr() { local ip; ip=$(dev_ip) || return 1; [ -z "$ip" ] && return 1; echo "$ip:$PORT"; }
+
+# Ask the container service to unfreeze (no-op when already running). Without
+# this, adb would hang whenever Android suspended the container.
+unfreeze() {
+    gdbus call --system --dest id.waydro.Container --object-path /ContainerManager \
+        --method id.waydro.ContainerManager.Unfreeze >/dev/null 2>&1 || true
+}
+
+# Connect adb if not already; succeed only if the device is reachable.
+ensure_adb() {
+    unfreeze
+    local a; a=$(addr) || return 1
+    "$ADB" start-server >/dev/null 2>&1 || true
+    "$ADB" devices | awk 'NR>1{print $1}' | grep -qx "$a" && return 0
+    "$ADB" connect "$a" >/dev/null 2>&1 || true
+    "$ADB" devices | awk 'NR>1{print $1}' | grep -qx "$a"
+}
+
+# Run an adb command against the device, connecting first.
+adb_d() {
+    local a; a=$(addr) || die "device not running (run: waydroid-emu start)"
+    ensure_adb || die "cannot reach device at $a (is it still running?)"
+    "$ADB" -s "$a" "$@"
+}
+
+start_emu() {
+    if waydroid status 2>/dev/null | grep -q 'Session:[[:space:]]*RUNNING'; then
+        log "session already running"
+        if ensure_adb; then log "adb connected at $(addr)"; return 0; fi
+        log "adb not reachable yet; retrying..."
+        for _ in $(seq 1 30); do ensure_adb && { log "adb connected at $(addr)"; return 0; }; sleep 2; done
+        die "could not reach adb"
+    fi
+
+    # Serialize concurrent boots.
+    if ! mkdir "$LOCK" 2>/dev/null; then
+        if [ -f "$LOCK/pid" ] && kill -0 "$(cat "$LOCK/pid" 2>/dev/null)" 2>/dev/null; then
+            log "another start is in progress; waiting..."
+            for _ in $(seq 1 150); do
+                waydroid status 2>/dev/null | grep -q 'Session:[[:space:]]*RUNNING' && break
+                sleep 1
+            done
+        else
+            rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || die "could not acquire lock"
+        fi
+    fi
+    echo "$$" >"$LOCK/pid"
+    trap 'rm -rf "$LOCK" 2>/dev/null' EXIT
+
+    # 1) Headless Wayland compositor (no window).
+    if ! pgrep -f "weston .*--socket=$SOCKET" >/dev/null 2>&1; then
+        rm -f "$XDG_RUNTIME_DIR/$SOCKET" "$XDG_RUNTIME_DIR/$SOCKET.lock"
+        log "starting headless compositor"
+        setsid bash -c "exec weston --backend=headless-backend.so --socket=$SOCKET --width=720 --height=1280" \
+            >"$WESTON_LOG" 2>&1 </dev/null &
+        for _ in $(seq 1 40); do [ -S "$XDG_RUNTIME_DIR/$SOCKET" ] && break; sleep 0.25; done
+        [ -S "$XDG_RUNTIME_DIR/$SOCKET" ] || die "compositor failed; see $WESTON_LOG"
+    fi
+
+    # 2) Android session (wait until Android is actually ready).
+    log "starting Android (first boot can take ~90s)"
+    : >"$SESSION_LOG"
+    setsid bash -c "export WAYLAND_DISPLAY=$SOCKET XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR; exec waydroid session start" \
+        >"$SESSION_LOG" 2>&1 </dev/null &
+    for _ in $(seq 1 150); do
+        grep -q 'is ready' "$SESSION_LOG" 2>/dev/null && break
+        sleep 1
+    done
+    grep -q 'is ready' "$SESSION_LOG" 2>/dev/null || die "Android did not boot; see $SESSION_LOG"
+
+    # 3) ADB.
+    ensure_adb || die "adb did not connect"
+    # Keep the screen on so Android never suspends and freezes the container.
+    adb_d shell "svc power stayon true" >/dev/null 2>&1 || true
+    adb_d shell "settings put system screen_off_timeout 2147483647" >/dev/null 2>&1 || true
+    trap - EXIT
+    rm -rf "$LOCK" 2>/dev/null
+    log "ready. adb device: $(addr)"
+    log "try: waydroid-emu shot /tmp/shot.png"
+}
+
+stop_emu() {
+    waydroid session stop >/dev/null 2>&1 || true
+    pkill -f "weston .*--socket=$SOCKET" 2>/dev/null || true
+    rm -rf "$LOCK" 2>/dev/null
+    rm -f "$XDG_RUNTIME_DIR/$SOCKET" "$XDG_RUNTIME_DIR/$SOCKET.lock" 2>/dev/null
+    log "stopped"
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+    start|ensure)   start_emu ;;
+    stop)           stop_emu ;;
+    status)
+        waydroid status 2>&1 | sed 's/^/  /'
+        echo "  adb: $("$ADB" devices 2>/dev/null | awk 'NR>1{print $1" ("$2")"}' | paste -sd, -)" ;;
+    connect)        ensure_adb && log "connected at $(addr)" || die "connect failed" ;;
+    ip)             addr ;;
+    shot)
+        out="${1:-/tmp/waydroid-shot.png}"
+        adb_d exec-out screencap -p >"$out" && log "screenshot -> $out" ;;
+    tap)            [ $# -ge 2 ] || die "usage: tap X Y"; adb_d shell input tap "$1" "$2" ;;
+    swipe)          [ $# -ge 4 ] || die "usage: swipe X1 Y1 X2 Y2 [ms]"
+                    adb_d shell input swipe "$1" "$2" "$3" "$4" "${5:-300}" ;;
+    text)           [ $# -ge 1 ] || die "usage: text \"...\""; adb_d shell input text "$1" ;;
+    key)            [ $# -ge 1 ] || die "usage: key KEYCODE"; adb_d shell input keyevent "$1" ;;
+    install)        [ $# -ge 1 ] || die "usage: install app.apk"; adb_d install -r "$1" ;;
+    launch)
+        [ $# -ge 1 ] || die "usage: launch PKG [PKG/ACTIVITY]"
+        if [ "${1#*/}" != "$1" ]; then
+            adb_d shell am start -n "$1"
+        else
+            comp=$(adb_d shell "cmd package resolve-activity --brief $1" 2>/dev/null | tail -1)
+            [ -n "$comp" ] && [ "$comp" != "$1" ] || die "could not resolve launcher activity for $1"
+            adb_d shell am start -n "$comp"
+        fi ;;
+    packages)       adb_d shell pm list packages ;;
+    logcat)         adb_d logcat -d -t "${1:-200}" ;;
+    shell)          [ $# -ge 1 ] || die "usage: shell \"cmd\""; adb_d shell "$*" ;;
+    help|-h|--help) awk 'NR>1 && /^#/{sub(/^# ?/,""); print; next} NR>1{exit}' "$0" ;;
+    *)              die "unknown command: $cmd (try: waydroid-emu help)" ;;
+esac

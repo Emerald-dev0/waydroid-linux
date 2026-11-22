@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Waydroid
+Comment=Run Android apps (nested Wayland on X11)
+Exec=__BIN_DIR__/waydroid-ui
+Icon=waydroid
+Terminal=false
+Categories=System;
+StartupNotify=false

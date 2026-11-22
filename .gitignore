@@ -1,0 +1,12 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Waydroid runtime artifacts (never commit these)
+*.log
+*.img
+*.apk
+*.png
+waydroid-*.lock
